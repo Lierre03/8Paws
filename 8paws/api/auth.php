@@ -1,6 +1,16 @@
+
 <?php
 // Always return JSON
 header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+
+// Handle preflight requests
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit;
+}
 
 // Handle all PHP errors and exceptions as JSON
 set_error_handler(function($errno, $errstr, $errfile, $errline) {
@@ -30,7 +40,37 @@ use PHPMailer\PHPMailer\Exception;
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'POST') {
-    $input = json_decode(file_get_contents('php://input'), true);
+    // Get raw input and log for debugging
+    $rawInput = file_get_contents('php://input');
+    
+    // Add debug logging (remove in production)
+    error_log("Raw input: " . $rawInput);
+    
+    // Check if we have any input
+    if (empty($rawInput)) {
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error' => 'No input data received'
+        ]);
+        exit;
+    }
+    
+    $input = json_decode($rawInput, true);
+    
+    // Check for JSON decode errors
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error' => 'Invalid JSON: ' . json_last_error_msg()
+        ]);
+        exit;
+    }
+    
+    // Log decoded input for debugging
+    error_log("Decoded input: " . print_r($input, true));
+    
     $action = $input['action'] ?? '';
 
     // A more robust way to handle API actions using a switch statement
@@ -57,36 +97,67 @@ if ($method === 'POST') {
         case 'verify_token':
             verifyToken();
             break;
+        case 'verify_reset_code':
+            handleVerifyResetCode($input);
+            break;
+        case 'resend_reset_code':
+            handleResendResetCode($input);
+            break;
+        case 'check_role':
+            checkUserRole();
+            break;
         default:
             http_response_code(400);
-            echo json_encode(['error' => 'Invalid action']);
+            echo json_encode([
+                'success' => false,
+                'error' => 'Invalid action: ' . $action
+            ]);
             break;
     }
 } else {
     http_response_code(405);
-    echo json_encode(['error' => 'Method not allowed']);
+    echo json_encode([
+        'success' => false,
+        'error' => 'Method not allowed'
+    ]);
 }
-// This is the most crucial change: The script should always exit after a response is sent.
-// Putting it outside the if/else and switch blocks guarantees termination.
 exit;
 
-// The rest of your functions are below. The key change is ensuring
-// each function is responsible for its own JSON output AND calls `exit;`
-// to stop further execution.
+
+
+
+
 
 function handleLogin($input) {
     try {
         $db = getDB();
         
-        if (empty($input['email']) || empty($input['password'])) {
-            throw new Exception('Email and password are required');
+        // Better input validation with more descriptive errors
+        if (!isset($input['email']) || empty(trim($input['email']))) {
+            throw new Exception('Email is required');
         }
         
-        $stmt = $db->prepare("SELECT id, password_hash, email_verified, is_active, first_name, last_name FROM users WHERE email = ?");
-        $stmt->execute([$input['email']]);
+        if (!isset($input['password']) || empty($input['password'])) {
+            throw new Exception('Password is required');
+        }
+        
+        $email = trim($input['email']);
+        $password = $input['password'];
+        
+        // Log the email being used (remove in production)
+        error_log("Login attempt for email: " . $email);
+        
+$stmt = $db->prepare("SELECT id, password_hash, email_verified, is_active, first_name, last_name, role FROM users WHERE email = ?");
+        $stmt->execute([$email]);
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
         
-        if (!$user || !password_verify($input['password'], $user['password_hash'])) {
+        if (!$user) {
+            error_log("User not found for email: " . $email);
+            throw new Exception('Invalid email or password');
+        }
+        
+        if (!password_verify($password, $user['password_hash'])) {
+            error_log("Password verification failed for email: " . $email);
             throw new Exception('Invalid email or password');
         }
         
@@ -98,26 +169,31 @@ function handleLogin($input) {
             throw new Exception('Your account has been deactivated. Please contact support');
         }
         
-        $token = generateJWT($user['id'], $user['email']);
+        $token = generateJWT($user['id'], $email);
         
         $stmt = $db->prepare("UPDATE users SET last_login = NOW() WHERE id = ?");
         $stmt->execute([$user['id']]);
         
         echo json_encode([
-            'success' => true,
-            'token' => $token,
-            'user_id' => $user['id'],
-            'user' => [
-                'name' => $user['first_name'] . ' ' . $user['last_name'],
-                'email' => $input['email']
-            ]
-        ]);
-        exit; // Terminate script after successful JSON output
+    'success' => true,
+    'token' => $token,
+    'user_id' => $user['id'],
+    'user' => [
+        'name' => $user['first_name'] . ' ' . $user['last_name'],
+        'email' => $email,
+        'role' => $user['role']
+    ]
+]);
+        exit;
         
     } catch(Exception $e) {
+        error_log("Login error: " . $e->getMessage());
         http_response_code(400);
-        echo json_encode(['error' => $e->getMessage()]);
-        exit; // Terminate script after error JSON output
+        echo json_encode([
+            'success' => false,
+            'error' => $e->getMessage()
+        ]);
+        exit;
     }
 }
 
@@ -126,10 +202,11 @@ function handleSignup($input) {
         $db = getDB();
         
         // Validate required fields
-        $required = ['firstName', 'lastName', 'email', 'phone', 'password'];
+        $required = ['firstName', 'lastName', 'email', 'phone', 'address', 'emergencyContactName', 'emergencyContactNo', 'password'];
         foreach ($required as $field) {
-            if (empty($input[$field])) {
-                throw new Exception(ucfirst($field) . ' is required');
+            if (!isset($input[$field]) || empty(trim($input[$field]))) {
+                $fieldName = str_replace(['emergencyContactName', 'emergencyContactNo'], ['Emergency Contact Name', 'Emergency Contact Number'], $field);
+                throw new Exception(ucfirst($fieldName) . ' is required');
             }
         }
         
@@ -165,19 +242,22 @@ function handleSignup($input) {
         $verificationToken = bin2hex(random_bytes(32));
         
         $stmt = $db->prepare("
-            INSERT INTO users (first_name, last_name, email, phone, password_hash, verification_code, verification_token, marketing_emails) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (first_name, last_name, email, phone, address, emergency_contact_name, emergency_contact_no, password_hash, verification_code, verification_token) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ");
-        
+
         $stmt->execute([
             $input['firstName'],
             $input['lastName'],
             $input['email'],
             $input['phone'],
+            $input['address'],
+            $input['emergencyContactName'],
+            $input['emergencyContactNo'],
             $passwordHash,
             $verificationCode,
             $verificationToken,
-            $input['marketingEmails'] ? 1 : 0
+            // isset($input['marketingEmails']) ? ($input['marketingEmails'] ? 1 : 0) : 0
         ]);
         
         $userId = $db->lastInsertId();
@@ -192,15 +272,18 @@ function handleSignup($input) {
             'verification_token' => $verificationToken,
             'message' => 'Account created successfully. Please check your email for verification code.'
         ]);
-        exit; // Terminate script after successful JSON output
+        exit;
         
     } catch(Exception $e) {
-        if ($db->inTransaction()) {
+        if (isset($db) && $db->inTransaction()) {
             $db->rollback();
         }
         http_response_code(400);
-        echo json_encode(['error' => $e->getMessage()]);
-        exit; // Terminate script after error JSON output
+        echo json_encode([
+            'success' => false,
+            'error' => $e->getMessage()
+        ]);
+        exit;
     }
 }
 
@@ -208,12 +291,16 @@ function handleEmailVerification($input) {
     try {
         $db = getDB();
         
-        if (empty($input['verification_token']) || empty($input['verification_code'])) {
-            throw new Exception('Verification token and code are required');
+        if (!isset($input['verification_token']) || empty($input['verification_token'])) {
+            throw new Exception('Verification token is required');
+        }
+        
+        if (!isset($input['verification_code']) || empty($input['verification_code'])) {
+            throw new Exception('Verification code is required');
         }
         
         $stmt = $db->prepare("
-            SELECT id, email, verification_code, verification_code_expires, first_name, last_name 
+            SELECT id, email, verification_code, verification_code_expires, first_name, last_name, role 
             FROM users 
             WHERE verification_token = ? AND email_verified = 0
         ");
@@ -224,7 +311,7 @@ function handleEmailVerification($input) {
             throw new Exception('Invalid verification token or email already verified');
         }
         
-        if (strtotime($user['verification_code_expires']) < time()) {
+        if ($user['verification_code_expires'] && strtotime($user['verification_code_expires']) < time()) {
             throw new Exception('Verification code has expired. Please request a new one.');
         }
         
@@ -247,16 +334,20 @@ function handleEmailVerification($input) {
             'user_id' => $user['id'],
             'user' => [
                 'name' => $user['first_name'] . ' ' . $user['last_name'],
-                'email' => $user['email']
+                'email' => $user['email'],
+                'role' => $user['role']
             ],
             'message' => 'Email verified successfully!'
         ]);
-        exit; // Terminate script after successful JSON output
+        exit;
         
     } catch(Exception $e) {
         http_response_code(400);
-        echo json_encode(['error' => $e->getMessage()]);
-        exit; // Terminate script after error JSON output
+        echo json_encode([
+            'success' => false,
+            'error' => $e->getMessage()
+        ]);
+        exit;
     }
 }
 
@@ -264,7 +355,7 @@ function handleResendVerification($input) {
     try {
         $db = getDB();
         
-        if (empty($input['verification_token'])) {
+        if (!isset($input['verification_token']) || empty($input['verification_token'])) {
             throw new Exception('Verification token is required');
         }
         
@@ -295,12 +386,15 @@ function handleResendVerification($input) {
             'success' => true,
             'message' => 'New verification code sent to your email'
         ]);
-        exit; // Terminate script after successful JSON output
+        exit;
         
     } catch(Exception $e) {
         http_response_code(400);
-        echo json_encode(['error' => $e->getMessage()]);
-        exit; // Terminate script after error JSON output
+        echo json_encode([
+            'success' => false,
+            'error' => $e->getMessage()
+        ]);
+        exit;
     }
 }
 
@@ -308,12 +402,14 @@ function handleForgotPassword($input) {
     try {
         $db = getDB();
         
-        if (empty($input['email'])) {
+        if (!isset($input['email']) || empty(trim($input['email']))) {
             throw new Exception('Email is required');
         }
         
+        $email = trim($input['email']);
+        
         $stmt = $db->prepare("SELECT id, first_name FROM users WHERE email = ? AND email_verified = 1");
-        $stmt->execute([$input['email']]);
+        $stmt->execute([$email]);
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
         
         if (!$user) {
@@ -321,40 +417,255 @@ function handleForgotPassword($input) {
                 'success' => true,
                 'message' => 'If an account with this email exists, you will receive reset instructions.'
             ]);
-            exit; // Must exit here too
+            exit;
         }
         
+        $resetCode = sprintf('%06d', mt_rand(0, 999999));
         $resetToken = bin2hex(random_bytes(32));
-        $resetExpires = date('Y-m-d H:i:s', strtotime('+1 hour'));
+        $resetExpires = date('Y-m-d H:i:s', strtotime('+30 minutes'));
         
         $stmt = $db->prepare("
             UPDATE users 
-            SET password_reset_token = ?, password_reset_expires = ? 
+            SET password_reset_token = ?, password_reset_code = ?, password_reset_code_expires = ? 
             WHERE id = ?
         ");
-        $stmt->execute([$resetToken, $resetExpires, $user['id']]);
+        $stmt->execute([$resetToken, $resetCode, $resetExpires, $user['id']]);
         
-        sendPasswordResetEmail($input['email'], $user['first_name'], $resetToken);
+        sendPasswordResetCodeEmail($email, $user['first_name'], $resetCode);
         
         echo json_encode([
             'success' => true,
-            'message' => 'Password reset instructions sent to your email'
+            'reset_token' => $resetToken,
+            'message' => 'Password reset code sent to your email'
         ]);
-        exit; // Terminate script after successful JSON output
+        exit;
         
     } catch(Exception $e) {
         http_response_code(400);
-        echo json_encode(['error' => $e->getMessage()]);
-        exit; // Terminate script after error JSON output
+        echo json_encode([
+            'success' => false,
+            'error' => $e->getMessage()
+        ]);
+        exit;
     }
 }
+
+function handleVerifyResetCode($input) {
+    try {
+        $db = getDB();
+        
+        if (!isset($input['reset_token']) || empty($input['reset_token'])) {
+            throw new Exception('Reset token is required');
+        }
+        
+        if (!isset($input['reset_code']) || empty($input['reset_code'])) {
+            throw new Exception('Reset code is required');
+        }
+        
+        $stmt = $db->prepare("
+            SELECT id, email, password_reset_code, password_reset_code_expires, first_name, last_name 
+            FROM users 
+            WHERE password_reset_token = ?
+        ");
+        $stmt->execute([$input['reset_token']]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$user) {
+            throw new Exception('Invalid reset token');
+        }
+        
+        if ($user['password_reset_code_expires'] && strtotime($user['password_reset_code_expires']) < time()) {
+            throw new Exception('Reset code has expired. Please request a new one.');
+        }
+        
+        if ($user['password_reset_code'] !== $input['reset_code']) {
+            throw new Exception('Invalid reset code');
+        }
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'Reset code verified successfully!'
+        ]);
+        exit;
+        
+    } catch(Exception $e) {
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error' => $e->getMessage()
+        ]);
+        exit;
+    }
+}
+
+function handleResendResetCode($input) {
+    try {
+        $db = getDB();
+        
+        if (!isset($input['reset_token']) || empty($input['reset_token'])) {
+            throw new Exception('Reset token is required');
+        }
+        
+        $stmt = $db->prepare("
+            SELECT id, email, first_name 
+            FROM users 
+            WHERE password_reset_token = ?
+        ");
+        $stmt->execute([$input['reset_token']]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$user) {
+            throw new Exception('Invalid reset token');
+        }
+        
+        $resetCode = sprintf('%06d', mt_rand(0, 999999));
+        
+        $stmt = $db->prepare("
+            UPDATE users 
+            SET password_reset_code = ?, password_reset_code_expires = DATE_ADD(NOW(), INTERVAL 30 MINUTE) 
+            WHERE id = ?
+        ");
+        $stmt->execute([$resetCode, $user['id']]);
+        
+        sendPasswordResetCodeEmail($user['email'], $user['first_name'], $resetCode);
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'New reset code sent to your email'
+        ]);
+        exit;
+        
+    } catch(Exception $e) {
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error' => $e->getMessage()
+        ]);
+        exit;
+    }
+}
+
+
+
+function sendPasswordResetCodeEmail($email, $firstName, $resetCode) {
+    $mail = new PHPMailer(true);
+    
+    try {
+        $mail->isSMTP();
+        $mail->Host       = 'smtp.gmail.com';
+        $mail->SMTPAuth   = true;
+        $mail->Username   = '8pawspetboutique@gmail.com';
+        $mail->Password   = 'ofvcexgxpmmzoond';
+        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+        $mail->Port       = 587;
+        
+        $mail->setFrom('8pawspetboutique@gmail.com', '8Paws Pet Boutique');
+        $mail->addAddress($email, $firstName);
+        
+        $mail->isHTML(true);
+        $mail->Subject = 'Password Reset Code - 8Paws Pet Boutique';
+        $mail->Body = getPasswordResetCodeEmailTemplate($firstName, $resetCode);
+        
+        $mail->send();
+    } catch (Exception $e) {
+        error_log("Email could not be sent. Mailer Error: {$mail->ErrorInfo}");
+        throw new Exception('Failed to send reset code email');
+    }
+}
+
+function getPasswordResetCodeEmailTemplate($firstName, $resetCode) {
+    return "
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset='UTF-8'>
+        <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+        <title>Password Reset Code</title>
+        <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+            .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+            .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+            .content { background: white; padding: 30px; border-radius: 0 0 10px 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .code-box { background: #f8f9fa; border: 2px dashed #667eea; padding: 20px; text-align: center; margin: 20px 0; border-radius: 8px; }
+            .code { font-size: 32px; font-weight: bold; color: #667eea; font-family: monospace; letter-spacing: 8px; }
+            .footer { text-align: center; padding: 20px; color: #666; font-size: 14px; }
+            .warning { background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 15px; border-radius: 6px; margin: 15px 0; }
+        </style>
+    </head>
+    <body>
+        <div class='container'>
+            <div class='header'>
+                <h1>🔑 Password Reset Code</h1>
+                <p>8Paws Pet Boutique & Grooming Salon</p>
+            </div>
+            <div class='content'>
+                <h2>Hi $firstName,</h2>
+                <p>We received a request to reset the password for your 8Paws Pet Boutique account.</p>
+                
+                <div class='code-box'>
+                    <p style='margin: 0 0 10px 0; font-weight: bold;'>Your Password Reset Code:</p>
+                    <div class='code'>$resetCode</div>
+                </div>
+                
+                <p>Enter this code to verify your identity and proceed with resetting your password. This code will expire in 30 minutes.</p>
+                
+                <div class='warning'>
+                    <strong>⚠️ Security Notice:</strong><br>
+                    If you didn't request this password reset, please ignore this email. Your account remains secure.
+                </div>
+                
+                <p>For security reasons, this code can only be used once. If you need another reset code, please request a new one.</p>
+                
+                <p>Best regards,<br>
+                The 8Paws Pet Boutique Team</p>
+            </div>
+            <div class='footer'>
+                <p>8Paws Pet Boutique & Grooming Salon<br>
+                📍 123 Pet Street, Quezon City | 📞 (02) 8123-4567<br>
+                📧 info@8pawspetboutique.com</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    ";
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 function handleResetPassword($input) {
     try {
         $db = getDB();
         
-        if (empty($input['token']) || empty($input['password'])) {
-            throw new Exception('Reset token and new password are required');
+        if (!isset($input['reset_token']) || empty($input['reset_token'])) {
+            throw new Exception('Reset token is required');
+        }
+        
+        if (!isset($input['reset_code']) || empty($input['reset_code'])) {
+            throw new Exception('Reset code is required');
+        }
+        
+        if (!isset($input['password']) || empty($input['password'])) {
+            throw new Exception('New password is required');
         }
         
         if (strlen($input['password']) < 8) {
@@ -362,21 +673,29 @@ function handleResetPassword($input) {
         }
         
         $stmt = $db->prepare("
-            SELECT id 
+            SELECT id, password_reset_code, password_reset_code_expires 
             FROM users 
-            WHERE password_reset_token = ? AND password_reset_expires > NOW()
+            WHERE password_reset_token = ?
         ");
-        $stmt->execute([$input['token']]);
+        $stmt->execute([$input['reset_token']]);
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
         
         if (!$user) {
-            throw new Exception('Invalid or expired reset token');
+            throw new Exception('Invalid reset token');
+        }
+        
+        if ($user['password_reset_code_expires'] && strtotime($user['password_reset_code_expires']) < time()) {
+            throw new Exception('Reset code has expired');
+        }
+        
+        if ($user['password_reset_code'] !== $input['reset_code']) {
+            throw new Exception('Invalid reset code');
         }
         
         $passwordHash = password_hash($input['password'], PASSWORD_DEFAULT);
         $stmt = $db->prepare("
             UPDATE users 
-            SET password_hash = ?, password_reset_token = NULL, password_reset_expires = NULL 
+            SET password_hash = ?, password_reset_token = NULL, password_reset_code = NULL, password_reset_code_expires = NULL 
             WHERE id = ?
         ");
         $stmt->execute([$passwordHash, $user['id']]);
@@ -385,14 +704,22 @@ function handleResetPassword($input) {
             'success' => true,
             'message' => 'Password reset successfully'
         ]);
-        exit; // Terminate script after successful JSON output
+        exit;
         
     } catch(Exception $e) {
         http_response_code(400);
-        echo json_encode(['error' => $e->getMessage()]);
-        exit; // Terminate script after error JSON output
+        echo json_encode([
+            'success' => false,
+            'error' => $e->getMessage()
+        ]);
+        exit;
     }
 }
+
+
+
+
+
 
 function verifyToken() {
     try {
@@ -408,12 +735,62 @@ function verifyToken() {
             'user_id' => $decoded->user_id,
             'email' => $decoded->email
         ]);
-        exit; // Terminate script after successful JSON output
+        exit;
         
     } catch(Exception $e) {
         http_response_code(401);
-        echo json_encode(['error' => 'Invalid token']);
-        exit; // Terminate script after error JSON output
+        echo json_encode([
+            'success' => false,
+            'error' => 'Invalid token'
+        ]);
+        exit;
+    }
+}
+
+
+
+function checkUserRole() {
+    try {
+        $token = getBearerToken();
+        if (!$token) {
+            throw new Exception('No token provided');
+        }
+        
+        $decoded = verifyJWT($token);
+        $db = getDB();
+        
+        // Check if user exists and has customer role
+        $stmt = $db->prepare("SELECT id, email, role, is_active FROM users WHERE id = ? AND email = ?");
+        $stmt->execute([$decoded->user_id, $decoded->email]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$user) {
+            throw new Exception('User not found');
+        }
+        
+        if (!$user['is_active']) {
+            throw new Exception('Account is deactivated');
+        }
+        
+        if ($user['role'] !== 'customer') {
+            throw new Exception('Access denied. Customer role required.');
+        }
+        
+        echo json_encode([
+            'success' => true,
+            'user_id' => $user['id'],
+            'email' => $user['email'],
+            'role' => $user['role']
+        ]);
+        exit;
+        
+    } catch(Exception $e) {
+        http_response_code(403);
+        echo json_encode([
+            'success' => false,
+            'error' => $e->getMessage()
+        ]);
+        exit;
     }
 }
 
@@ -523,7 +900,7 @@ function sendPasswordResetEmail($email, $firstName, $resetToken) {
         $mail->isSMTP();
         $mail->Host       = 'smtp.gmail.com';
         $mail->SMTPAuth   = true;
-        $mail->Username   = 'your-email@gmail.com';
+        $mail->Username   = '8pawspetboutique@gmail.com'; // Fixed email address
         $mail->Password   = 'ofvcexgxpmmzoond';
         $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
         $mail->Port       = 587;
@@ -583,7 +960,7 @@ function getVerificationEmailTemplate($firstName, $verificationCode) {
                     <li>📅 Book grooming appointments online</li>
                     <li>📱 Track your pet's grooming progress in real-time</li>
                     <li>📋 View service history and receipts</li>
-                    <li>🔔 Receive SMS updates and reminders</li>
+                    <li>🔔 Receive email updates and reminders</li>
                 </ul>
                 
                 <p>If you didn't create this account, you can safely ignore this email.</p>
@@ -665,4 +1042,8 @@ function getPasswordResetEmailTemplate($firstName, $resetToken) {
     </html>
     ";
 }
+
+
+
+
 ?>
